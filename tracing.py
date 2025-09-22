@@ -20,3 +20,4 @@ trace.get_tracer_provider().add_span_processor(span_processor)
 
 print("Tracing initialized with OTLP → Jaeger 🚀")
 print("checking how git and github works")
+print("checking how git and github works 2")
