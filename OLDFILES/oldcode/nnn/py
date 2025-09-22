@@ -1,0 +1,126 @@
+import asyncio
+import nest_asyncio
+import os
+import streamlit as st
+from dotenv import load_dotenv
+from langchain_community.vectorstores import FAISS
+from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+from tracing import tracer  # your tracing.py providing `tracer`
+
+# ------------------- ASYNCIO FIX -------------------
+try:
+    asyncio.get_running_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+nest_asyncio.apply()
+
+# ------------------- LOAD API KEY -------------------
+load_dotenv()
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+if not GOOGLE_API_KEY:
+    st.error("⚠️ GOOGLE_API_KEY not found in .env file")
+    st.stop()
+
+# ------------------- LOAD EMBEDDINGS & INDEX -------------------
+embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+
+try:
+    vectorstore = FAISS.load_local(
+        "storage/books_index",
+        embeddings,
+        allow_dangerous_deserialization=True
+    )
+except Exception as e:
+    st.error(f"Failed to load FAISS index: {e}")
+    st.stop()
+
+# ------------------- INITIALIZE LLM -------------------
+llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
+
+# ------------------- STREAMLIT UI -------------------
+st.title("📚 Book RAG Assistant — Source Detector")
+st.write("Paste a line or short paragraph and I will try to find which book it comes from.")
+
+# single text input (unique key)
+query = st.text_input("🔎 Paste the line here:", key="source_detect_input")
+
+# ------------------- SETTINGS -------------------
+# NOTE: FAISS typically returns *distance* (lower = more similar).
+# Adjust threshold according to your embeddings & metric.
+SIMILARITY_THRESHOLD = 0.40
+TOP_K = 3  # number of candidates to retrieve
+
+# Helper to format float safely
+def fmt_score(s):
+    try:
+        return f"{s:.4f}"
+    except Exception:
+        return str(s)
+
+# ------------------- QUERY HANDLING -------------------
+if query:
+    with tracer.start_as_current_span("user_query_received") as user_span:
+        user_span.set_attribute("query_text", query)
+        st.write(f"### 🔍 Searching for source of the line:")
+
+        # ------- VECTOR SEARCH -------
+        with tracer.start_as_current_span("vector_search") as vs_span:
+            results = vectorstore.similarity_search_with_score(query, k=TOP_K)
+            vs_span.set_attribute("num_results", len(results))
+
+            if results:
+                top_doc, top_score = results[0]
+                vs_span.set_attribute("top_score", float(top_score))
+                is_relevant = top_score < SIMILARITY_THRESHOLD
+            else:
+                top_doc, top_score = None, None
+                is_relevant = False
+
+        # ------- IF DATABASE MATCH -------
+        if is_relevant:
+            doc, score = results[0]
+            title = doc.metadata.get("title", "Unknown Title")
+            author = doc.metadata.get("author", "Unknown Author")
+            st.success(f"📖 Matched book: **{title}** — *{author}* (score: {fmt_score(score)})")
+            st.write("---")
+            st.write(doc.page_content)  # show matched chunk
+
+            # Offer to show other top candidates
+            if len(results) > 1:
+                if st.checkbox("Show other top matches", key="show_other_matches"):
+                    st.write("### Other candidates:")
+                    for i, (cand_doc, cand_score) in enumerate(results[1:], start=2):
+                        t = cand_doc.metadata.get("title", "Unknown Title")
+                        a = cand_doc.metadata.get("author", "Unknown Author")
+                        st.write(f"**{i}. {t}** — {a} (score: {fmt_score(cand_score)})")
+                        st.write(cand_doc.page_content[:800])
+                        st.write("---")
+
+        # ------- IF NO GOOD MATCH -------
+        else:
+            st.warning("⚠️ I couldn't find a confident match in the database.")
+            st.write("Would you like me to try searching with the LLM (may use external knowledge)?")
+
+            # Use a radio so answer choice persists per query
+            use_llm = st.radio("Search with LLM?", ("No", "Yes"), index=0, key="use_llm_radio")
+
+            if use_llm == "Yes":
+                with tracer.start_as_current_span("llm_response_generation") as llm_span:
+                    # Provide retrieved context if any (helps LLM decide)
+                    context = "\n\n".join([d.page_content for d, s in results]) if results else ""
+                    prompt = (
+                        "You are given the following candidate context from books (may be empty) "
+                        "and a line. Determine which book (title + author) the line most likely "
+                        "comes from using only the context if it matches. If it does not match, "
+                        "answer clearly 'Not found in provided books' and then optionally provide a best-effort guess "
+                        "based on general knowledge.\n\n"
+                        f"CONTEXT:\n{context}\n\nLINE:\n{query}\n\n"
+                        "Answer format:\n1) MATCHED: <Title> — <Author> (if confident)\n2) EXCERPT: <small excerpt from context that matches>\n3) NOTE: <if not found, say 'Not found in provided books'>"
+                    )
+
+                    response = llm.invoke(prompt)
+                    # response.content expected; fall back to str(response)
+                    content = getattr(response, "content", str(response))
+                    llm_span.set_attribute("response_length", len(content))
+                    st.info("🤖 LLM Response (source-detection attempt)")
+                    st.write(content)
